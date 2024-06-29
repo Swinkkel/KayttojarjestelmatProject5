@@ -10,6 +10,7 @@
 
 // Structure to deliver data for thread.
 typedef struct {
+	int thread_id;
 	char* start;
 	size_t size;
 } thread_data_t;
@@ -17,7 +18,7 @@ typedef struct {
 // Linked list structure to store data processed by threads.
 typedef struct linked_list_s {
 	char c;
-	size_t nr;
+	unsigned int nr;
 	struct linked_list_s* next;
 } linked_list_t;
 
@@ -26,42 +27,47 @@ typedef struct linked_list_s {
 static void* process_file(void* arg) {
 
 	thread_data_t* data = (thread_data_t*) arg;
-	
-	int count = 1;
 
-	linked_list_t* root = NULL;
+	linked_list_t* root = malloc(sizeof(linked_list_t));
+	if (root == NULL) {
+		return NULL;
+	}
+
+	root->c = data->start[0];
+	root->nr = 1;
+	root->next = NULL;
 
 	// If we have only one character then special handling for that case.
 	if (data->size == 1) {
-		linked_list_t* new_slot = malloc(sizeof(linked_list_t));
-		new_slot->c = data->start[0];
-		new_slot->nr = count;
-		root = new_slot;
+		return root;
 	}
-	else {
-		// Reserve memory for new linked list item.
-		linked_list_t* new_slot = malloc(sizeof(linked_list_t));
-		root = new_slot;
 
-		// Read characters from stream.
-		for (int i=1;i<data->size;++i) {
-			if (i == data->size || data->start[i] != data->start[i-1]) {
-				// If last character or character is different than the previous one then
-				// store character and count of these character to current linked list item.
-				new_slot->c = data->start[i-1];
-				new_slot->nr = count;
-				if (i == data->size) {
-					break;
-				}
-				
-				// Reserve memory for next linked list item and set pointer to it.
-				linked_list_t* next = malloc(sizeof(linked_list_t));
-				new_slot->next = next;
-				count = 1;
+	linked_list_t* current_item = root;
+
+	// Read characters from stream.
+	for (int i=1;i<data->size;++i) {
+		if (i == data->size || data->start[i] != data->start[i-1]) {
+			// If last character or character is different than the previous one then
+			// reserve new linked list item and add it to linked list.
+			if (i == data->size) {
+				break;
 			}
-			else {
-				++count;
+
+			// Reserve memory for next linked list item and set pointer to it.
+			linked_list_t* next = malloc(sizeof(linked_list_t));
+			if (next == NULL) {
+				return NULL;
 			}
+
+			next->nr = 1;
+			next->c = data->start[i];
+			next->next = NULL;
+		
+			current_item->next = next;
+			current_item = next;
+		}
+		else {
+			++current_item->nr;
 		}
 	}
 
@@ -78,7 +84,8 @@ int main(int argc, char*argv[]) {
 	// Get number of available cores.
 	int nr_cores = get_nprocs_conf();
 
-	fprintf(stdout, "Number of available cores: %d\n", nr_cores);
+	// Linked list to store packing information.
+	linked_list_t* combined = NULL;
 
 	for (int i=1;i<argc;++i) {
 		// Open file in read mode.
@@ -90,7 +97,7 @@ int main(int argc, char*argv[]) {
 
 		// Get file descriptor from FILE pointer.
 		int fd = fileno(file_ptr);
-		if (fd == -1) {		
+		if (fd == -1) {
 			perror("Failed to get file descriptor");
 			fclose(file_ptr);
 			exit(-1);
@@ -112,40 +119,35 @@ int main(int argc, char*argv[]) {
 			exit(-1);
 		}
 
-		fprintf(stdout, "file size in bytes: %lld\n", (long long)file_info.st_size);
-
 		// Get the number of threads needed.
 		int nr_threads = file_info.st_size < nr_cores ? file_info.st_size : nr_cores;
 
 		pthread_t threads[nr_threads];
 		size_t part_size = file_info.st_size / nr_threads;
-		thread_data_t* thread_data = NULL;
-
-		fprintf(stdout, "Number of threads: %d, bytes for each thread: %ld\n", nr_threads, part_size);
+		thread_data_t** thread_data = (thread_data_t**)malloc(nr_threads * sizeof(thread_data_t*));
 
 		for (size_t i=0;i<nr_threads;++i) {
 			// Reserve memory for thread data
-			thread_data = malloc(sizeof(thread_data_t));
-			if (thread_data == NULL) {
+			thread_data[i] = malloc(sizeof(thread_data_t));
+			if (thread_data[i] == NULL) {
 				perror("Failed to reserve memory");
 				munmap(data, file_info.st_size);
 				fclose(file_ptr);
 				exit(-1);
 			}
-			
-			thread_data->start = data + i * part_size;
-			thread_data->size = (i == nr_threads -1) ? file_info.st_size - i * part_size : part_size;
+
+			thread_data[i]->thread_id = i;
+			thread_data[i]->start = data + i * part_size;
+			thread_data[i]->size = (i == nr_threads -1) ? file_info.st_size - i * part_size : part_size;
 
 			// Create thread and pass the info what do process for thread.
-			if (pthread_create(&threads[i], NULL, process_file, thread_data)) {
+			if (pthread_create(&threads[i], NULL, process_file, thread_data[i])) {
 				perror("Failed to create thread");
 				munmap(data, file_info.st_size);
 				fclose(file_ptr);
 				exit(-1);
 			}
 		}
-
-		linked_list_t* combined = NULL;
 
 		// Now wait that threads do their work.
 		for (size_t i=0;i < nr_threads;++i) {
@@ -173,25 +175,37 @@ int main(int argc, char*argv[]) {
 					if (last->c == thread_result->c) {
 						last->nr += thread_result->nr;
 						last->next = thread_result->next;
+						free(thread_result);
 					}
 					else {
 						last->next = thread_result;
 					}
 				}
 			}
+
+			free(thread_data[i]);
 		}
 
-		// Go through combined result.
-		linked_list_t* tmp = combined;
-		while (tmp != NULL) {
-			fprintf(stdout, "%ld%c", tmp->nr, tmp->c);
-			tmp = tmp->next;
-		}
+		free(thread_data);
 
 		// Clean up
 		munmap(data, file_info.st_size);
 		fclose(file_ptr);
 	}
-	
+
+	// Go through combined result.
+	linked_list_t* tmp = combined;
+	while (tmp != NULL) {
+		fwrite(&tmp->nr, sizeof(int), 1, stdout);
+		fwrite(&tmp->c, sizeof(char), 1, stdout);
+
+		// Free memory.
+		linked_list_t* free_this = tmp;
+
+		tmp = tmp->next;
+
+		free(free_this);
+	}
+
 	return 0;
 }
